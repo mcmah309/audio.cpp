@@ -241,9 +241,10 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
         first_audio_phases.emplace_back(name, std::chrono::duration<double, std::milli>(now - profile_marked).count());
         profile_marked = now;
     };
-    const auto prompt = build_drama3_prompt(*assets_, tokenizer_, text, references, history,
-        generated_history, static_cast<size_t>(cache_steps_ - 1));
-    const auto max_frames = std::min(sampling.max_frames, cache_steps_ - static_cast<int64_t>(prompt.size()));
+    const auto prepared = build_drama3_generation_prompt(*assets_, tokenizer_, text, references,
+        history, generated_history, cache_steps_, sampling.max_frames);
+    const auto & prompt = prepared.frames;
+    const auto max_frames = prepared.generation_budget;
     debug::trace_log_scalar("drama3.prompt_rows", prompt.size());
     debug::trace_log_scalar("drama3.generation_budget", max_frames);
     if (max_frames < sampling.max_frames) {
@@ -299,6 +300,8 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
     std::deque<int32_t> recent;
     std::vector<Drama3Frame> output_frames;
     Drama3Generation result;
+    result.generation_budget = max_frames;
+    result.prompt_rows = static_cast<int64_t>(prompt.size());
     std::mutex codec_mutex;
     std::condition_variable codec_ready;
     std::deque<Drama3Frame> codec_queue;

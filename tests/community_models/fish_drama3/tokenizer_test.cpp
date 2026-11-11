@@ -2,6 +2,7 @@
 #include "engine/community_models/fish_drama3/prompt.h"
 #include "engine/framework/debug/trace.h"
 #include "engine/framework/io/json.h"
+#include "engine/framework/model_spec/package.h"
 #include "engine/framework/runtime/errors.h"
 
 #include <iostream>
@@ -13,11 +14,16 @@ namespace json = engine::io::json;
 int main(int argc, char ** argv) {
     try {
         if (argc != 3 && !(argc == 4 && std::string(argv[3]) == "--log"))
-            throw std::runtime_error("usage: tokenizer_test SIDECAR_DIRECTORY VECTORS_JSON [--log]");
+            throw std::runtime_error("usage: tokenizer_test SIDECAR_DIRECTORY_OR_GGUF VECTORS_JSON [--log]");
         if (argc == 4) engine::debug::configure_logging({true, std::nullopt});
-        engine::assets::ResourceBundle resources(argv[1]);
-        resources.add_model_files({{"tokenizer_json", "tokenizer.json"},
-                                   {"tokenizer_config", "tokenizer_config.json"}});
+        engine::assets::ResourceBundle resources;
+        if (std::filesystem::is_regular_file(argv[1])) {
+            resources = engine::model_spec::load_resource_bundle_for_family(argv[1], "fish_drama3");
+        } else {
+            resources = engine::assets::ResourceBundle(argv[1]);
+            resources.add_model_files({{"tokenizer_json", "tokenizer.json"},
+                                       {"tokenizer_config", "tokenizer_config.json"}});
+        }
         drama::Drama3TextTokenizer tokenizer(resources);
         const auto vectors = json::parse_file(argv[2]);
         int passed = 0;
@@ -64,6 +70,41 @@ int main(int argc, char ** argv) {
         try { drama::build_drama3_prompt(assets, tokenizer, "<|im_start|>", {reference}, {explicit_take}, generated, 1); }
         catch (const engine::runtime::InvalidRequestError &) { invalid_rejected = true; }
         if (!invalid_rejected) throw std::runtime_error("prompt fitting must not hide malformed input");
+        const auto context = static_cast<int64_t>(full.size() + 100);
+        const auto requested = context - static_cast<int64_t>(anchor.size());
+        const auto fitted = drama::build_drama3_generation_prompt(assets, tokenizer, next_text,
+            {reference}, {explicit_take}, generated, context, requested);
+        if (fitted.frames != anchor || fitted.generation_budget != requested)
+            throw std::runtime_error("automatic latest history must yield to the requested output budget");
+        const auto all_output = context - static_cast<int64_t>(mandatory.size());
+        const auto no_auto = drama::build_drama3_generation_prompt(assets, tokenizer, next_text,
+            {reference}, {explicit_take}, generated, context, all_output);
+        if (no_auto.frames != mandatory || no_auto.generation_budget != all_output)
+            throw std::runtime_error("all automatic history must yield before reducing requested output");
+        const auto capped = drama::build_drama3_generation_prompt(assets, tokenizer, next_text,
+            {reference}, {explicit_take}, generated, context, context);
+        if (capped.frames != mandatory || capped.generation_budget != all_output)
+            throw std::runtime_error("only mandatory prompt rows may reduce requested output capacity");
+        bool required_overflow = false;
+        try {
+            drama::build_drama3_generation_prompt(assets, tokenizer, next_text,
+                {reference}, {explicit_take}, generated, mandatory.size(), 1);
+        } catch (const engine::runtime::CapacityError &) { required_overflow = true; }
+        if (!required_overflow) throw std::runtime_error("mandatory prompt must leave at least one generation row");
+        const std::vector<std::string> expected_segments{"<|speaker:1|> One paragraph.", " Otro párrafo. "};
+        if (drama::parse_drama3_text_segments("[\"<|speaker:1|> One paragraph.\",\" Otro párrafo. \"]") != expected_segments)
+            throw std::runtime_error("explicit segments must preserve order and exact text");
+        const std::vector<std::string> invalid_segments = {
+            "[]", "{}", "null", "[1]", "[\"valid\",null]", "[\"\"]", "[\" \\n\\u2003\"]",
+            "[\"valid\",\"<|im_start|>\"]", "[\"<|speaker:16|> invalid\"]", "[\"unfinished]",
+            std::string("[\"") + std::string("\xc0\xaf", 2) + "\"]",
+        };
+        for (const auto & value : invalid_segments) {
+            bool rejected = false;
+            try { drama::parse_drama3_text_segments(value); }
+            catch (const engine::runtime::InvalidRequestError &) { rejected = true; }
+            if (!rejected) throw std::runtime_error("malformed explicit segments accepted");
+        }
         const std::vector<std::string> invalid = {
             std::string("\xc0\xaf", 2), std::string("\xed\xa0\x80", 3),
             std::string("\xf4\x90\x80\x80", 4), std::string("\xe2\x82", 2),

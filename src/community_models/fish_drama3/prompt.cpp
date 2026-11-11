@@ -2,6 +2,9 @@
 
 #include "engine/framework/runtime/errors.h"
 #include "engine/framework/debug/trace.h"
+#include "engine/framework/io/json.h"
+
+#include <utf8proc.h>
 
 #include <algorithm>
 #include <array>
@@ -48,6 +51,17 @@ std::string tagged(const std::string & text, bool reference) {
 }  // namespace
 
 void validate_drama3_text(const std::string & text, const char * location) {
+    size_t position = 0;
+    while (position < text.size()) {
+        utf8proc_int32_t code;
+        const auto width = utf8proc_iterate(
+            reinterpret_cast<const utf8proc_uint8_t *>(text.data() + position),
+            static_cast<utf8proc_ssize_t>(text.size() - position), &code);
+        if (width < 0 || code == 0) {
+            throw runtime::InvalidRequestError(std::string(location) + ": invalid UTF-8 text");
+        }
+        position += static_cast<size_t>(width);
+    }
     if (leading_space_bytes(text) == text.size()) throw runtime::InvalidRequestError(std::string(location) + ": text is empty");
     for (const auto * token : {"<|im_start|>", "<|im_end|>", "<|voice|>", "<|text|>", "<|interleave|>", "<|semantic:"}) {
         if (text.find(token) != std::string::npos) throw runtime::InvalidRequestError(std::string(location) + ": structural tokens are reserved for the prompt builder");
@@ -62,6 +76,26 @@ void validate_drama3_text(const std::string & text, const char * location) {
             throw runtime::InvalidRequestError(std::string(location) + ": speaker tags require N in 0..15 without leading zeroes");
         }
         offset += match.length();
+    }
+}
+
+std::vector<std::string> parse_drama3_text_segments(std::string_view value) {
+    try {
+        const auto parsed = io::json::parse(value);
+        if (!parsed.is_array() || parsed.as_array().empty()) {
+            throw runtime::InvalidRequestError("Drama 3 text_segments requires a nonempty JSON array of strings");
+        }
+        std::vector<std::string> segments;
+        for (const auto & item : parsed.as_array()) {
+            if (!item.is_string()) {
+                throw runtime::InvalidRequestError("Drama 3 text_segments entries must be strings");
+            }
+            validate_drama3_text(item.as_string(), "text_segments");
+            segments.push_back(item.as_string());
+        }
+        return segments;
+    } catch (const std::runtime_error & error) {
+        throw runtime::InvalidRequestError(error.what());
     }
 }
 
@@ -138,6 +172,24 @@ std::vector<Drama3Frame> build_drama3_prompt(const Drama3Assets & assets,
     }
     debug::trace_log_scalar("drama3.history.generated_turns", retained);
     return frames;
+}
+
+Drama3GenerationPrompt build_drama3_generation_prompt(const Drama3Assets & assets,
+    const Drama3TextTokenizer & tokenizer, const std::string & text,
+    const std::vector<Drama3Take> & references, const std::vector<Drama3Take> & history,
+    const std::vector<Drama3Take> & generated_history, int64_t context_length,
+    int64_t requested_frames) {
+    if (context_length <= 1 || requested_frames <= 0) {
+        throw runtime::CapacityError("Drama 3 requires context capacity for both input and generation");
+    }
+    auto required = build_drama3_prompt(assets, tokenizer, text, references, history, {},
+        static_cast<size_t>(context_length - 1));
+    const auto budget = std::min(requested_frames,
+        context_length - static_cast<int64_t>(required.size()));
+    if (generated_history.empty()) return {std::move(required), budget};
+    auto frames = build_drama3_prompt(assets, tokenizer, text, references, history,
+        generated_history, static_cast<size_t>(context_length - budget));
+    return {std::move(frames), budget};
 }
 
 }  // namespace engine::models::fish_drama3

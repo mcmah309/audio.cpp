@@ -19,6 +19,8 @@ struct Drama3Sampling {
 struct Drama3Generation {
     codecs::FishDacCodes codes;
     runtime::AudioBuffer audio;
+    int64_t generation_budget = 0;
+    int64_t prompt_rows = 0;
     bool reached_limit = false;
 };
 

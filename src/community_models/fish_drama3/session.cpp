@@ -131,6 +131,10 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
     for (const auto & option : request.options) effective.options[option.first] = option.second;
     effective.input_artifacts = request.input_artifacts;
     if (!effective.text_input) throw runtime::InvalidRequestError("Drama 3 requires input text");
+    std::optional<std::vector<std::string>> explicit_segments;
+    if (const auto segments = runtime::find_option(effective.options, {"text_segments"})) {
+        explicit_segments = parse_drama3_text_segments(*segments);
+    }
     Drama3Sampling sampling;
     std::optional<uint32_t> seed;
     try {
@@ -204,15 +208,22 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
     }
     const auto skip_empty = runtime::find_option(effective.options, {"skip_empty_chunks"});
     const bool skip_empty_chunks = skip_empty && runtime::parse_bool_option(*skip_empty, "skip_empty_chunks");
-    const int64_t chunk_size = runtime::parse_positive_i64_option(effective.options, {"text_chunk_size"}, 128);
-    const auto mode = engine::text::parse_text_chunk_mode_override(effective.options).value_or(engine::text::TextChunkMode::TagAware);
-    const auto chunks = runtime::chunk_text_request(effective, chunk_size, mode);
+    std::vector<std::string> texts;
+    if (explicit_segments) {
+        texts = std::move(*explicit_segments);
+    } else {
+        const int64_t chunk_size = runtime::parse_positive_i64_option(effective.options, {"text_chunk_size"}, 128);
+        const auto mode = engine::text::parse_text_chunk_mode_override(effective.options).value_or(engine::text::TextChunkMode::TagAware);
+        const auto chunks = runtime::chunk_text_request(effective, chunk_size, mode);
+        for (const auto & chunk : chunks) texts.push_back(chunk.text_input->text);
+    }
     runtime::TaskResult result;
     runtime::AudioBuffer merged;
     std::vector<Drama3Take> generated_takes;
+    json::Value::Array segments;
     const auto started = std::chrono::steady_clock::now();
     bool limited = false;
-    for (size_t index = 0; index < chunks.size(); ++index) {
+    for (size_t index = 0; index < texts.size(); ++index) {
         auto chunk_sampling = sampling;
         chunk_sampling.seed += static_cast<uint32_t>(index);
         std::function<void(const runtime::AudioBuffer &)> callback;
@@ -223,10 +234,19 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
                 stream_event_sink()(event);
             };
         }
-        const auto & text = chunks[index].text_input->text;
+        const auto & text = texts[index];
         auto generated = generator_->generate(text, references, history, chunk_sampling, streaming, callback, index > 0, generated_takes, skip_empty_chunks);
+        const auto start_sample = merged.samples.size();
+        if (generated.codes.frames != 0) runtime::append_audio_buffer(merged, generated.audio);
+        segments.push_back(json::Value::make_object({
+            {"text", json::Value::make_string(text)},
+            {"start_sample", json::Value::make_number(start_sample)},
+            {"end_sample", json::Value::make_number(merged.samples.size())},
+            {"frames", json::Value::make_number(generated.codes.frames)},
+            {"generation_budget", json::Value::make_number(generated.generation_budget)},
+            {"prompt_rows", json::Value::make_number(generated.prompt_rows)},
+            {"reached_limit", json::Value::make_bool(generated.reached_limit)}}));
         if (generated.codes.frames == 0) continue;
-        runtime::append_audio_buffer(merged, generated.audio);
         limited = limited || generated.reached_limit;
         generated_takes.push_back({text, std::move(generated.codes)});
     }
@@ -236,6 +256,9 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
     Drama3Take take{effective.text_input->text, join_codes(generated_takes)};
     result.output_artifacts.push_back(runtime::make_text_artifact(runtime::ArtifactKind::AcousticTokens,
         "drama3_take", json::stringify(take_json(take)), {{"family", "fish_drama3"}, {"schema", "drama3_take_v1"}}));
+    result.output_artifacts.push_back(runtime::make_text_artifact(runtime::ArtifactKind::Custom,
+        "drama3_segments", json::stringify(json::Value::make_array(std::move(segments))),
+        {{"family", "fish_drama3"}, {"schema", "drama3_segments_v1"}}));
     result.audio_output = std::move(merged);
     const auto wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
     engine::debug::timing_log_scalar("session.wall_ms", wall_ms);
