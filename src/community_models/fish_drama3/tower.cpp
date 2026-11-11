@@ -208,14 +208,25 @@ public:
         }
         // The last prompt row predicts the first generated frame. Its tower
         // cache entry is filled by generation, after the semantic draw.
-        const int64_t steps = static_cast<int64_t>(frames.size()) - 1;
-        if (steps == 0) return;
-        if (steps > capacity_) throw std::runtime_error("Drama 3 tower prefill exceeds cache length");
-        std::vector<float> hidden(input.begin(), input.begin() + steps * config_.hidden_size);
-        std::vector<Drama3Frame> current(frames.begin(), frames.end() - 1);
+        const int64_t total_steps = static_cast<int64_t>(frames.size()) - 1;
+        if (total_steps > capacity_) throw std::runtime_error("Drama 3 tower prefill exceeds cache length");
+        // Bound activation workspace while retaining the complete timeline in
+        // KV caches. Labels belong to the next global row, including across a
+        // block boundary; only the final prompt row is left for generation.
+        constexpr int64_t block_rows = Drama3Tower::prefill_block_rows;
+        for (int64_t start = 0; start < total_steps; start += block_rows) {
+            prefill_block(input, frames, start, std::min(block_rows, total_steps - start));
+        }
+    }
+
+    void prefill_block(const std::vector<float> & input, const std::vector<Drama3Frame> & frames,
+                       int64_t start, int64_t steps) {
+        const auto hidden_begin = input.begin() + start * config_.hidden_size;
+        std::vector<float> hidden(hidden_begin, hidden_begin + steps * config_.hidden_size);
+        std::vector<Drama3Frame> current(frames.begin() + start, frames.begin() + start + steps);
         std::vector<float> masks(static_cast<size_t>(steps));
         std::vector<int32_t> codes(static_cast<size_t>(steps));
-        for (int64_t row = 0; row < steps; ++row) masks[row] = semantic(frames[row + 1], config_) ? 1.0F : 0.0F;
+        for (int64_t row = 0; row < steps; ++row) masks[row] = semantic(frames[start + row + 1], config_) ? 1.0F : 0.0F;
         const auto extra = shared_input(current);
         std::unique_ptr<LayerGraph> temporary;
         auto * graph = prefill_graph(steps, temporary);
@@ -223,17 +234,17 @@ public:
         ggml_backend_tensor_set(graph->label_mask, masks.data(), 0, masks.size() * sizeof(float));
         ggml_backend_tensor_set(graph->extra, extra.data(), 0, extra.size() * sizeof(float));
         std::vector<int32_t> positions(static_cast<size_t>(steps));
-        for (int64_t row = 0; row < steps; ++row) positions[row] = static_cast<int32_t>(row);
+        for (int64_t row = 0; row < steps; ++row) positions[row] = static_cast<int32_t>(start + row);
         ggml_backend_tensor_set(graph->positions, positions.data(), 0, positions.size() * sizeof(int32_t));
         std::vector<ggml_fp16_t> attention_mask(static_cast<size_t>(capacity_ * steps));
         const auto negative_infinity = ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity());
         for (int64_t row = 0; row < steps; ++row) for (int64_t key = 0; key < capacity_; ++key) {
-            attention_mask[row * capacity_ + key] = key <= row ? ggml_fp32_to_fp16(0) : negative_infinity;
+            attention_mask[row * capacity_ + key] = key <= start + row ? ggml_fp32_to_fp16(0) : negative_infinity;
         }
         ggml_backend_tensor_set(graph->attention_mask, attention_mask.data(), 0, attention_mask.size() * sizeof(ggml_fp16_t));
         for (size_t book = 0; book < graph->book_codes.size(); ++book) {
             for (int64_t row = 0; row < steps; ++row) {
-                codes[row] = frames[row + 1][1 + book];
+                codes[row] = frames[start + row + 1][1 + book];
                 if (codes[row] < 0 || codes[row] >= config_.codebook_size) throw std::runtime_error("Drama 3 code is outside the codebook");
             }
             ggml_backend_tensor_set(graph->book_codes[book], codes.data(), 0, codes.size() * sizeof(int32_t));

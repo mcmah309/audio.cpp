@@ -76,11 +76,41 @@ int main(int argc, char ** argv) {
             {reference}, {explicit_take}, generated, context, requested);
         if (fitted.frames != anchor || fitted.generation_budget != requested)
             throw std::runtime_error("automatic latest history must yield to the requested output budget");
+        if (fitted.retention.retained_generated_history_turns != 1 ||
+            !fitted.retention.retained_first_generated_history ||
+            fitted.retention.retained_latest_generated_history || fitted.retention.explicit_history_turns != 1)
+            throw std::runtime_error("retention metadata must describe the fitted first-only history");
+        bool recent_history_rejected = false;
+        try {
+            drama::build_drama3_generation_prompt(assets, tokenizer, next_text,
+                {reference}, {explicit_take}, generated, context, requested, true);
+        } catch (const engine::runtime::CapacityError &) { recent_history_rejected = true; }
+        if (!recent_history_rejected)
+            throw std::runtime_error("requiring recent history must reject a prompt that drops the latest take");
+        const auto full_fit = drama::build_drama3_generation_prompt(assets, tokenizer, next_text,
+            {reference}, {explicit_take}, generated, context, 100, true);
+        if (full_fit.frames != full || full_fit.retention.retained_generated_history_turns != 2 ||
+            !full_fit.retention.retained_first_generated_history || !full_fit.retention.retained_latest_generated_history)
+            throw std::runtime_error("retention metadata must report both distinct retained automatic turns");
+        const auto one_prior = drama::build_drama3_generation_prompt(assets, tokenizer, next_text,
+            {reference}, {explicit_take}, {first_take}, context, requested, true);
+        if (one_prior.frames != anchor || one_prior.retention.retained_generated_history_turns != 1 ||
+            !one_prior.retention.retained_first_generated_history || !one_prior.retention.retained_latest_generated_history)
+            throw std::runtime_error("one prior generated take is both first and latest");
+        const auto first_segment = drama::build_drama3_generation_prompt(assets, tokenizer, next_text,
+            {reference}, {explicit_take}, {}, context, requested, true);
+        if (first_segment.frames != mandatory || first_segment.retention.retained_generated_history_turns != 0 ||
+            first_segment.retention.retained_first_generated_history || first_segment.retention.retained_latest_generated_history ||
+            first_segment.retention.explicit_history_turns != 1)
+            throw std::runtime_error("a first segment has no automatic history requirement");
         const auto all_output = context - static_cast<int64_t>(mandatory.size());
         const auto no_auto = drama::build_drama3_generation_prompt(assets, tokenizer, next_text,
             {reference}, {explicit_take}, generated, context, all_output);
         if (no_auto.frames != mandatory || no_auto.generation_budget != all_output)
             throw std::runtime_error("all automatic history must yield before reducing requested output");
+        if (no_auto.retention.retained_generated_history_turns != 0 ||
+            no_auto.retention.retained_first_generated_history || no_auto.retention.retained_latest_generated_history)
+            throw std::runtime_error("retention metadata must report that all automatic history was removed");
         const auto capped = drama::build_drama3_generation_prompt(assets, tokenizer, next_text,
             {reference}, {explicit_take}, generated, context, context);
         if (capped.frames != mandatory || capped.generation_budget != all_output)

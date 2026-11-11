@@ -242,7 +242,7 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
         profile_marked = now;
     };
     const auto prepared = build_drama3_generation_prompt(*assets_, tokenizer_, text, references,
-        history, generated_history, cache_steps_, sampling.max_frames);
+        history, generated_history, cache_steps_, sampling.max_frames, sampling.require_recent_history);
     const auto & prompt = prepared.frames;
     const auto max_frames = prepared.generation_budget;
     debug::trace_log_scalar("drama3.prompt_rows", prompt.size());
@@ -302,6 +302,7 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
     Drama3Generation result;
     result.generation_budget = max_frames;
     result.prompt_rows = static_cast<int64_t>(prompt.size());
+    result.retention = prepared.retention;
     std::mutex codec_mutex;
     std::condition_variable codec_ready;
     std::deque<Drama3Frame> codec_queue;
@@ -495,6 +496,41 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
     debug::timing_log_scalar("drama3.generated_frames", output_frames.size());
     if (result.reached_limit) std::cerr << "[fish_drama3] generation budget reached; audio may be incomplete\n";
     return result;
+}
+
+runtime::AudioBuffer Drama3Generator::decode_continuously(const std::vector<Drama3Take> & takes) {
+    codec_->reset_decode_stream();
+    struct ResetCodec {
+        codecs::FishDacCodecRuntime & codec;
+        ~ResetCodec() { codec.reset_decode_stream(); }
+    } reset{*codec_};
+    runtime::AudioBuffer merged;
+    for (const auto & take : takes) {
+        validate_drama3_codes(take.codes, assets_->tower.codebook_size);
+        // Match the normal streaming controller's growth and final partial batch
+        // for each take, changing only whether decoder state survives the join.
+        size_t target = 1;
+        for (int64_t start = 0; start < take.codes.frames;) {
+            const auto count = std::min<int64_t>(static_cast<int64_t>(target), take.codes.frames - start);
+            codecs::FishDacCodes batch;
+            batch.codebooks = take.codes.codebooks;
+            batch.frames = count;
+            batch.codes.reserve(static_cast<size_t>(batch.codebooks * count));
+            for (int64_t book = 0; book < batch.codebooks; ++book) {
+                const auto first = take.codes.codes.begin() + book * take.codes.frames + start;
+                batch.codes.insert(batch.codes.end(), first, first + count);
+            }
+            auto decoded = codec_->decode_stream(batch);
+            if (decoded.sample_rate != assets_->codec.sample_rate || decoded.channels != 1 ||
+                decoded.samples.size() != static_cast<size_t>(count * assets_->codec.frame_length)) {
+                throw std::runtime_error("Drama 3 continuous codec comparison returned an unexpected audio shape");
+            }
+            runtime::append_audio_buffer(merged, decoded);
+            start += count;
+            target += std::min(target, codec_batch_frames_ - target);
+        }
+    }
+    return merged;
 }
 
 }  // namespace engine::models::fish_drama3

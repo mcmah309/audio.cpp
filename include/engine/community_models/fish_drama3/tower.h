@@ -39,6 +39,8 @@ struct Drama3TowerOutput {
 // Its cache is independent of the backbone and persists across codebooks.
 class Drama3Tower {
 public:
+    static constexpr int64_t prefill_block_rows = 128;
+
     Drama3Tower(std::shared_ptr<const assets::TensorSource> weights,
                 Drama3TowerConfig config, core::ExecutionContext & execution,
                 int64_t cache_steps, size_t prefill_cache_bytes = 256u * 1024u * 1024u);

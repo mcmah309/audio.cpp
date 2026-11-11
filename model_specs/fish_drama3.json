@@ -84,6 +84,26 @@
         "default": 128
       },
       {
+        "name": "text_segments",
+        "type": "string",
+        "description": "Ordered nonempty text units as a JSON string array. Bypasses framework splitting and preserves exact text.",
+        "required": false
+      },
+      {
+        "name": "require_recent_history",
+        "type": "bool",
+        "description": "Fail when the latest automatically generated take cannot fit beside the reserved generation budget.",
+        "required": false,
+        "default": false
+      },
+      {
+        "name": "compare_joint_codec",
+        "type": "bool",
+        "description": "In streaming mode, return an additional drama3_joint_pcm artifact decoding the same codes with continuous causal codec state across text units.",
+        "required": false,
+        "default": false
+      },
+      {
         "name": "skip_empty_chunks",
         "type": "bool",
         "description": "Skip text chunks that emit EOS before producing audio, matching upstream. The request fails if all chunks are empty.",

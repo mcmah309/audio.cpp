@@ -240,6 +240,9 @@ checkpoint or session setting, or leaves the optional value unset as described.
 | `previous_takes_file` | `string` | Model/session default | JSON history file containing a take object or an ordered array of earlier takes. Avoids the Windows command-line length limit for VQ grids. |
 | `max_tokens` | `int` | `1024` | Maximum generated acoustic frames per text chunk (about 21.5 frames/second). Declared range: minimum 1. |
 | `text_chunk_size` | `int` | `128` | Maximum characters per long-form chunk. Declared range: minimum 1. |
+| `text_segments` | `string` | Unset | Ordered nonempty text units as a JSON string array. Bypasses framework splitting and preserves exact text. |
+| `require_recent_history` | `bool` | `false` | Fail if the latest automatically generated take cannot fit beside the reserved generation budget. |
+| `compare_joint_codec` | `bool` | `false` | In streaming mode, return a second PCM artifact decoded from the same codes with causal codec state retained across text units. |
 | `skip_empty_chunks` | `bool` | `false` | Log and skip chunks that emit EOS before producing audio. The request fails if all chunks are empty. |
 | `text_chunk_mode` | `word_budget`, `tag_aware`, `japanese`, `endline` | `tag_aware` | Framework text chunking mode. |
 | `temperature` | `float` | `1.0` | Main and residual sampling temperature. Zero makes the initial draws greedy; semantic repeat redraws retain the fixed Drama 3 RAS settings. Declared range: minimum 0. |
@@ -468,6 +471,12 @@ chunk as an anchor and the latest chunk as recent context, without duplicating
 the first chunk. If that prompt does not fit, automatic history is reduced to the first chunk only, then removed.
 References and caller-supplied history remain ordered and are never dropped.
 
+Set `require_recent_history=true` to reject a request rather than silently lose the latest automatic turn. The first unit has no automatic history requirement. The `drama3_segments` JSON artifact reports `retained_generated_history_turns`, `retained_first_generated_history`, `retained_latest_generated_history`, and `explicit_history_turns` after fitting each prompt. A single prior generated take counts once and is both first and latest.
+
+Audio-tower prompt prefill runs in blocks of at most 128 rows, retaining all earlier KV-cache rows and global positions between blocks. This bounds temporary activation workspace without shortening the prompt or dropping history. Teacher labels use the next global prompt row across block boundaries; the last prompt row still seeds generation. The segment artifact records this bound as `tower_prefill_block_rows`. Backbone prefill remains a full-prompt graph. Different matrix batch shapes can change floating-point rounding and therefore seeded sampling; compare listening variants using the same native build.
+
+For a controlled decoder comparison, `compare_joint_codec=true` retains the normal per-unit PCM as the main output and returns `drama3_joint_pcm` as an additional `Custom` artifact. Its payload is interleaved little-endian float32 PCM; metadata includes `sample_rate`, `channels`, `samples`, `format=pcm_f32le`, and `schema=drama3_pcm_f32le_v1`. This second decode uses the exact generated acoustic codes and the same per-unit batch schedule, preserving causal decoder state across unit boundaries. It adds decode time and does not change text conditioning, generation, recording length, or model sampling.
+
 `skip_empty_chunks=false` preserves the error when a chunk emits EOS before any
 audio frame. Set `--request-option skip_empty_chunks=true` to skip such chunks
 and continue in offline or streaming mode. Skipped chunks do not enter generated
@@ -475,11 +484,7 @@ voice history, matching upstream. If all chunks are empty, the request fails wit
 `Drama 3 produced no audio: all text chunks were empty`. Other errors are not
 suppressed.
 
-`max_tokens` is an upper bound: generation is capped to the rows remaining after
-the selected prompt within `fish_drama3.context_length`. Reductions are logged,
-and `reached_limit` reports reaching this effective budget. A required prompt
-that leaves no generation room is still rejected. These rules apply to both
-offline and streaming generation.
+`max_tokens` is an upper bound: generation capacity is reserved after the required references, caller history, and current text within `fish_drama3.context_length`, then optional generated history is fitted into the remaining rows. The required prompt can reduce the effective generation budget; `reached_limit` reports reaching that budget. A required prompt that leaves no generation room is rejected. These rules apply to both offline and streaming generation.
 
 ## Validation limits
 

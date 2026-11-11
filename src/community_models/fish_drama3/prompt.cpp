@@ -112,7 +112,8 @@ void validate_drama3_codes(const codecs::FishDacCodes & codes, int64_t size) {
 std::vector<Drama3Frame> build_drama3_prompt(const Drama3Assets & assets,
     const Drama3TextTokenizer & tokenizer, const std::string & text,
     const std::vector<Drama3Take> & references, const std::vector<Drama3Take> & history,
-    const std::vector<Drama3Take> & generated_history, size_t max_rows) {
+    const std::vector<Drama3Take> & generated_history, size_t max_rows,
+    Drama3HistoryRetention * retention) {
     std::vector<Drama3Frame> frames;
     const auto append_text = [&](const std::string & segment) {
         for (const auto token : tokenizer.encode(segment)) {
@@ -158,19 +159,26 @@ std::vector<Drama3Frame> build_drama3_prompt(const Drama3Assets & assets,
     auto input_begin = frames.size();
     user_turn(text);
     size_t retained = std::min<size_t>(generated_history.size(), 2);
+    bool retained_first = !generated_history.empty();
+    bool retained_latest = !generated_history.empty();
     if (frames.size() > max_rows && generated_history.size() > 1) {
         frames.erase(frames.begin() + latest_begin, frames.begin() + input_begin);
         input_begin = latest_begin;
         --retained;
+        retained_latest = false;
     }
     if (frames.size() > max_rows && !generated_history.empty()) {
         frames.erase(frames.begin() + first_begin, frames.begin() + input_begin);
         retained = 0;
+        retained_first = retained_latest = false;
     }
     if (frames.size() > max_rows) {
         throw runtime::CapacityError("Drama 3 required prompt leaves no room to generate within fish_drama3.context_length");
     }
     debug::trace_log_scalar("drama3.history.generated_turns", retained);
+    if (retention != nullptr) {
+        *retention = {retained, retained_first, retained_latest, history.size()};
+    }
     return frames;
 }
 
@@ -178,18 +186,22 @@ Drama3GenerationPrompt build_drama3_generation_prompt(const Drama3Assets & asset
     const Drama3TextTokenizer & tokenizer, const std::string & text,
     const std::vector<Drama3Take> & references, const std::vector<Drama3Take> & history,
     const std::vector<Drama3Take> & generated_history, int64_t context_length,
-    int64_t requested_frames) {
+    int64_t requested_frames, bool require_recent_history) {
     if (context_length <= 1 || requested_frames <= 0) {
         throw runtime::CapacityError("Drama 3 requires context capacity for both input and generation");
     }
+    Drama3HistoryRetention retention;
     auto required = build_drama3_prompt(assets, tokenizer, text, references, history, {},
-        static_cast<size_t>(context_length - 1));
+        static_cast<size_t>(context_length - 1), &retention);
     const auto budget = std::min(requested_frames,
         context_length - static_cast<int64_t>(required.size()));
-    if (generated_history.empty()) return {std::move(required), budget};
+    if (generated_history.empty()) return {std::move(required), budget, retention};
     auto frames = build_drama3_prompt(assets, tokenizer, text, references, history,
-        generated_history, static_cast<size_t>(context_length - budget));
-    return {std::move(frames), budget};
+        generated_history, static_cast<size_t>(context_length - budget), &retention);
+    if (require_recent_history && !retention.retained_latest_generated_history) {
+        throw runtime::CapacityError("Drama 3 latest generated history does not fit together with the requested generation budget");
+    }
+    return {std::move(frames), budget, retention};
 }
 
 }  // namespace engine::models::fish_drama3

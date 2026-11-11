@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 
@@ -60,6 +62,26 @@ json::Value take_json(const Drama3Take & take) {
     }
     return json::Value::make_object({{"text", json::Value::make_string(take.text)},
                                     {"vq_codes", json::Value::make_array(std::move(books))}});
+}
+
+runtime::VoiceArtifact joint_pcm_artifact(const runtime::AudioBuffer & audio) {
+    if (audio.samples.size() > std::numeric_limits<size_t>::max() / sizeof(float)) {
+        throw std::runtime_error("Drama 3 joint codec artifact size overflow");
+    }
+    static_assert(sizeof(float) == sizeof(uint32_t), "PCM comparison requires 32-bit floats");
+    std::vector<std::byte> payload(audio.samples.size() * sizeof(float));
+    for (size_t index = 0; index < audio.samples.size(); ++index) {
+        uint32_t bits;
+        std::memcpy(&bits, &audio.samples[index], sizeof(bits));
+        for (size_t byte = 0; byte < sizeof(bits); ++byte) {
+            payload[index * sizeof(bits) + byte] = static_cast<std::byte>((bits >> (8 * byte)) & 0xffU);
+        }
+    }
+    return runtime::make_voice_artifact(runtime::ArtifactKind::Custom, "drama3_joint_pcm",
+        std::move(payload), {{"family", "fish_drama3"}, {"schema", "drama3_pcm_f32le_v1"},
+            {"format", "pcm_f32le"}, {"decode_policy", "continuous_causal"},
+            {"sample_rate", std::to_string(audio.sample_rate)},
+            {"channels", std::to_string(audio.channels)}, {"samples", std::to_string(audio.samples.size())}});
 }
 
 codecs::FishDacCodes join_codes(const std::vector<Drama3Take> & takes) {
@@ -142,6 +164,9 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
         sampling.top_p = runtime::parse_finite_float_option(effective.options, {"top_p"}).value_or(0.9F);
         sampling.top_k = runtime::parse_int_option(effective.options, {"top_k"}).value_or(4097);
         sampling.max_frames = runtime::parse_positive_i64_option(effective.options, {"max_tokens", "max_new_tokens"}, 1024);
+        if (const auto require_recent = runtime::find_option(effective.options, {"require_recent_history"})) {
+            sampling.require_recent_history = runtime::parse_bool_option(*require_recent, "require_recent_history");
+        }
         seed = runtime::parse_u32_option(effective.options, {"seed"});
     } catch (const std::runtime_error & error) {
         throw runtime::InvalidRequestError(error.what());
@@ -208,6 +233,11 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
     }
     const auto skip_empty = runtime::find_option(effective.options, {"skip_empty_chunks"});
     const bool skip_empty_chunks = skip_empty && runtime::parse_bool_option(*skip_empty, "skip_empty_chunks");
+    const auto compare_joint = runtime::find_option(effective.options, {"compare_joint_codec"});
+    const bool compare_joint_codec = compare_joint && runtime::parse_bool_option(*compare_joint, "compare_joint_codec");
+    if (compare_joint_codec && !streaming) {
+        throw runtime::InvalidRequestError("Drama 3 joint codec comparison requires streaming mode");
+    }
     std::vector<std::string> texts;
     if (explicit_segments) {
         texts = std::move(*explicit_segments);
@@ -245,6 +275,11 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
             {"frames", json::Value::make_number(generated.codes.frames)},
             {"generation_budget", json::Value::make_number(generated.generation_budget)},
             {"prompt_rows", json::Value::make_number(generated.prompt_rows)},
+            {"tower_prefill_block_rows", json::Value::make_number(Drama3Tower::prefill_block_rows)},
+            {"retained_generated_history_turns", json::Value::make_number(generated.retention.retained_generated_history_turns)},
+            {"retained_first_generated_history", json::Value::make_bool(generated.retention.retained_first_generated_history)},
+            {"retained_latest_generated_history", json::Value::make_bool(generated.retention.retained_latest_generated_history)},
+            {"explicit_history_turns", json::Value::make_number(generated.retention.explicit_history_turns)},
             {"reached_limit", json::Value::make_bool(generated.reached_limit)}}));
         if (generated.codes.frames == 0) continue;
         limited = limited || generated.reached_limit;
@@ -254,6 +289,14 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
         throw std::runtime_error("Drama 3 produced no audio: all text chunks were empty");
     }
     Drama3Take take{effective.text_input->text, join_codes(generated_takes)};
+    if (compare_joint_codec) {
+        auto continuous = generator_->decode_continuously(generated_takes);
+        if (continuous.sample_rate != merged.sample_rate || continuous.channels != merged.channels ||
+            continuous.samples.size() != merged.samples.size()) {
+            throw std::runtime_error("Drama 3 joint codec comparison changed the recording length or format");
+        }
+        result.output_artifacts.push_back(joint_pcm_artifact(continuous));
+    }
     result.output_artifacts.push_back(runtime::make_text_artifact(runtime::ArtifactKind::AcousticTokens,
         "drama3_take", json::stringify(take_json(take)), {{"family", "fish_drama3"}, {"schema", "drama3_take_v1"}}));
     result.output_artifacts.push_back(runtime::make_text_artifact(runtime::ArtifactKind::Custom,

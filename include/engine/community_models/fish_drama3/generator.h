@@ -14,6 +14,7 @@ struct Drama3Sampling {
     int top_k = 4097;
     int64_t max_frames = 1024;
     uint32_t seed = 0;
+    bool require_recent_history = false;
 };
 
 struct Drama3Generation {
@@ -21,6 +22,7 @@ struct Drama3Generation {
     runtime::AudioBuffer audio;
     int64_t generation_budget = 0;
     int64_t prompt_rows = 0;
+    Drama3HistoryRetention retention;
     bool reached_limit = false;
 };
 
@@ -31,6 +33,9 @@ public:
     ~Drama3Generator();
     codecs::FishDacCodes encode_reference(const runtime::AudioBuffer & audio);
     void warm_streaming_codec(const codecs::FishDacCodes & reference);
+    // Decode these exact takes while retaining causal codec state between takes.
+    // The generation path is unchanged; this supports paired decoder comparisons.
+    runtime::AudioBuffer decode_continuously(const std::vector<Drama3Take> & takes);
     Drama3Generation generate(const std::string & text, const std::vector<Drama3Take> & references,
         const std::vector<Drama3Take> & history, const Drama3Sampling & sampling, bool streaming,
         const std::function<void(const runtime::AudioBuffer &)> & on_audio = {}, bool continuation = false,
