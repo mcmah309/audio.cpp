@@ -23,10 +23,11 @@ private:
     runtime::TaskResult generate_stream(const runtime::TaskRequest & request) override;
     void reset_stream_state() override {}
     runtime::TaskResult synthesize(const runtime::TaskRequest & request, bool streaming);
-    Drama3Take conditioning_take(const engine::io::json::Value & value);
+    Drama3Take conditioning_take(const engine::io::json::Value & value, bool require_codes = false);
     runtime::TaskSpec task_;
     std::shared_ptr<const Drama3Assets> assets_;
     std::unique_ptr<Drama3Generator> generator_;
+    std::unique_ptr<Drama3TextTokenizer> planning_tokenizer_;
     runtime::TaskRequest defaults_;
 };
 

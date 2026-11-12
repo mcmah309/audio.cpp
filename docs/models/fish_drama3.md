@@ -104,6 +104,20 @@ vectors use FP16 with the rest of the codec. The packages embed their tokenizer,
 configuration and model contract. Stock audio.cpp releases without this port
 cannot run Drama 3.
 
+## Inspect prompts before loading inference weights
+
+Create a CPU session with `fish_drama3.planning_only=true` to use the model's tokenizer and prompt builder without constructing the backbone, audio tower or codec. Supply one explicit `text_segments` entry matching the request text. Reference and history descriptors must contain pre-encoded `vq_codes`; planning does not encode reference waveforms or generate previous takes.
+
+An inspection request returns the `drama3_prompt` artifact:
+
+- `prompt_rows`: complete prompt occupancy, including references and supplied history.
+- `current_text_rows`: tokenized current text, including its speaker tag.
+- `history_turn_rows`: the current passage's completed-turn overhead, excluding acoustic frames; add its actual frame count when budgeting future history.
+
+Counts are returned even when a candidate exceeds the configured generation context. A normal inference session can also inspect a prompt using the request option `inspect_prompt=true`.
+
+The optional request option `inspect_memory_device=N` adds a `drama3_memory` artifact with the CUDA device's `total_bytes` and `free_bytes`, plus `weight_storage_bytes`, `fixed_state_bytes`, `cache_bytes_per_row` and `maximum_context_rows`. Querying device memory can initialize its CUDA context, but does not load inference weights. Storage/cache accounting assumes fully resident weights and the default F16 caches; it does not model overrides such as F32 caches. Codec packed/split views count once. Callers must separately reserve memory for graphs, codec workspace and allocator overhead. The free-memory snapshot does not reserve VRAM against other processes or guarantee an allocation will succeed.
+
 ## Generate and stream
 
 Host sampling is used by default. Set

@@ -26,6 +26,14 @@ struct Drama3GenerationPrompt {
     Drama3HistoryRetention retention;
 };
 
+// Exact model-row accounting for one explicit text unit. Completed history
+// contributes history_turn_rows plus its acoustic frame count.
+struct Drama3PromptInspection {
+    size_t prompt_rows;
+    size_t current_text_rows;
+    size_t history_turn_rows;
+};
+
 void validate_drama3_text(const std::string & text, const char * location);
 void validate_drama3_codes(const codecs::FishDacCodes & codes, int64_t codebook_size);
 std::vector<std::string> parse_drama3_text_segments(std::string_view value);
@@ -37,6 +45,10 @@ std::vector<Drama3Frame> build_drama3_prompt(const Drama3Assets & assets,
     const std::vector<Drama3Take> & generated_history = {},
     size_t max_rows = std::numeric_limits<size_t>::max(),
     Drama3HistoryRetention * retention = nullptr);
+
+Drama3PromptInspection inspect_drama3_prompt(const Drama3Assets & assets,
+    const Drama3TextTokenizer & tokenizer, const std::string & text,
+    const std::vector<Drama3Take> & references, const std::vector<Drama3Take> & history);
 
 // Reserve output capacity using required conditioning before fitting optional
 // generated history. Caller-supplied history and references remain mandatory.

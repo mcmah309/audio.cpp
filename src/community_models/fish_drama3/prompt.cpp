@@ -182,6 +182,17 @@ std::vector<Drama3Frame> build_drama3_prompt(const Drama3Assets & assets,
     return frames;
 }
 
+Drama3PromptInspection inspect_drama3_prompt(const Drama3Assets & assets,
+    const Drama3TextTokenizer & tokenizer, const std::string & text,
+    const std::vector<Drama3Take> & references, const std::vector<Drama3Take> & history) {
+    const auto prompt = build_drama3_prompt(assets, tokenizer, text, references, history);
+    auto extended_history = history;
+    extended_history.push_back({text, {std::vector<int32_t>(10, 0), 10, 1}});
+    const auto extended = build_drama3_prompt(assets, tokenizer, text, references, extended_history);
+    return {prompt.size(), tokenizer.encode(tagged(text, false)).size(),
+        extended.size() - prompt.size() - 1};
+}
+
 Drama3GenerationPrompt build_drama3_generation_prompt(const Drama3Assets & assets,
     const Drama3TextTokenizer & tokenizer, const std::string & text,
     const std::vector<Drama3Take> & references, const std::vector<Drama3Take> & history,

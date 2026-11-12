@@ -51,6 +51,27 @@ int main(int argc, char ** argv) {
         const auto mandatory = drama::build_drama3_prompt(assets, tokenizer, next_text, {reference}, {explicit_take});
         const auto anchor = drama::build_drama3_prompt(assets, tokenizer, next_text, {reference}, {explicit_take, first_take});
         const auto full = drama::build_drama3_prompt(assets, tokenizer, next_text, {reference}, {explicit_take, first_take, latest_take});
+        const auto counted = drama::inspect_drama3_prompt(assets, tokenizer, next_text,
+            {reference}, {explicit_take});
+        if (counted.prompt_rows != mandatory.size())
+            throw std::runtime_error("inspection must count the exact generation prompt");
+        const drama::Drama3Take appended_take{next_text, {std::vector<int32_t>(170, 1), 10, 17}};
+        const auto appended = drama::build_drama3_prompt(assets, tokenizer, next_text,
+            {reference}, {explicit_take, appended_take});
+        if (appended.size() != counted.prompt_rows + counted.history_turn_rows + 17)
+            throw std::runtime_error("completed-turn accounting must add exact text/template rows and acoustic frames");
+        const auto plain = drama::inspect_drama3_prompt(assets, tokenizer, next_text, {}, {});
+        const auto bare = drama::build_drama3_prompt(assets, tokenizer, next_text, {}, {});
+        if (plain.prompt_rows != bare.size() || plain.history_turn_rows != counted.history_turn_rows)
+            throw std::runtime_error("completed-turn size must be independent of reference and prior history");
+        if (counted.current_text_rows != tokenizer.encode("<|speaker:0|> " + next_text).size())
+            throw std::runtime_error("current text accounting must include the actual automatic speaker tag");
+        const auto tagged = drama::inspect_drama3_prompt(assets, tokenizer, "<|speaker:1|> ¡Árbol!", {}, {});
+        if (tagged.current_text_rows != tokenizer.encode("<|speaker:1|> ¡Árbol!").size())
+            throw std::runtime_error("inspection must preserve explicit speaker tags and Unicode tokenization");
+        if (drama::inspect_drama3_prompt(assets, tokenizer, "a\xcc\x81", {}, {}).prompt_rows !=
+            drama::inspect_drama3_prompt(assets, tokenizer, "á", {}, {}).prompt_rows)
+            throw std::runtime_error("inspection must apply the same Unicode normalization as generation");
         const std::vector<drama::Drama3Take> generated{first_take, middle_take, latest_take};
         if (drama::build_drama3_prompt(assets, tokenizer, next_text, {reference}, {explicit_take}, generated) != full)
             throw std::runtime_error("automatic history must retain first and latest, excluding middle");

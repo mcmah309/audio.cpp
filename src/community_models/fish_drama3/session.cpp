@@ -18,6 +18,69 @@ namespace engine::models::fish_drama3 {
 namespace {
 namespace json = engine::io::json;
 
+// Inspect residency without reading tensor payloads or loading inference weights.
+json::Value memory_profile(const Drama3Assets & assets, int device) {
+    const auto add = [](uint64_t left, uint64_t right) {
+        if (right > std::numeric_limits<uint64_t>::max() - left)
+            throw runtime::CapacityError("Drama 3 memory accounting overflow");
+        return left + right;
+    };
+    const auto multiply = [](uint64_t left, uint64_t right) {
+        if (right && left > std::numeric_limits<uint64_t>::max() / right)
+            throw runtime::CapacityError("Drama 3 memory accounting overflow");
+        return left * right;
+    };
+    uint64_t weights = 0;
+    for (const auto & source : {assets.model_weights, assets.codec_weights}) {
+        for (const auto & tensor : source->tensors()) {
+            const std::string packed_suffix = ".attention.wqkv.weight";
+            if (source == assets.codec_weights && tensor.name.size() >= packed_suffix.size() &&
+                tensor.name.compare(tensor.name.size() - packed_suffix.size(), packed_suffix.size(), packed_suffix) == 0) {
+                const auto prefix = tensor.name.substr(0, tensor.name.size() - packed_suffix.size()) + ".attention.";
+                if (source->has_tensor(prefix + "q_proj.weight") && source->has_tensor(prefix + "k_proj.weight") &&
+                    source->has_tensor(prefix + "v_proj.weight")) continue;
+            }
+            if (tensor.shape.empty()) throw runtime::CapacityError("Drama 3 tensor has no shape");
+            uint64_t rows = 1;
+            for (size_t i = 0; i < tensor.shape.size(); ++i) {
+                if (tensor.shape[i] <= 0) throw runtime::CapacityError("Drama 3 tensor has an invalid dimension");
+                if (i + 1 < tensor.shape.size()) rows = multiply(rows, tensor.shape[i]);
+            }
+            // Vectors are uploaded as F32. Count codec QKV split views instead of
+            // their unused packed source; this is not an allocator trace.
+            const auto type = tensor.shape.size() == 1 ? GGML_TYPE_F32 : assets::ggml_type_for_tensor_dtype(tensor.dtype);
+            if (tensor.shape.back() % ggml_blck_size(type))
+                throw runtime::CapacityError("Drama 3 tensor row is not block aligned");
+            weights = add(weights, multiply(rows, ggml_row_size(type, tensor.shape.back())));
+        }
+    }
+    const auto & b = assets.backbone;
+    const auto & t = assets.tower;
+    const auto full_layers = b.layers / b.full_attention_interval;
+    const auto linear_layers = b.layers - full_layers;
+    const auto tower_layers = t.shared_layers + t.residual_layers;
+    const uint64_t backbone_row = multiply(multiply(full_layers, b.kv_heads), b.head_dim);
+    const uint64_t tower_row = multiply(multiply(tower_layers, t.kv_heads), t.head_dim);
+    // Key and value, F16, plus the backbone F16 attention mask.
+    const uint64_t bytes_per_row = add(multiply(add(backbone_row, tower_row), 4), 2);
+    const auto state_values = multiply(multiply(b.linear_value_head_dim, b.linear_value_head_dim), b.linear_num_value_heads);
+    const auto conv_width = add(multiply(multiply(b.linear_key_head_dim, b.linear_num_key_heads), 2),
+        multiply(b.linear_value_head_dim, b.linear_num_value_heads));
+    const auto state_bytes = multiply(add(multiply(linear_layers + 1, state_values),
+        multiply(multiply(linear_layers, conv_width), b.linear_conv_kernel_dim - 1)), 4);
+    core::ensure_backends_loaded();
+    const auto snapshot = core::query_backend_memory(core::BackendConfig{core::BackendType::Cuda, device, 1});
+    if (!snapshot.available) throw runtime::CapacityError("CUDA device memory is unavailable for context selection");
+    return json::Value::make_object({
+        {"device", json::Value::make_number(device)},
+        {"total_bytes", json::Value::make_number(snapshot.total_bytes)},
+        {"free_bytes", json::Value::make_number(snapshot.free_bytes)},
+        {"weight_storage_bytes", json::Value::make_number(weights)},
+        {"fixed_state_bytes", json::Value::make_number(state_bytes)},
+        {"cache_bytes_per_row", json::Value::make_number(bytes_per_row)},
+        {"maximum_context_rows", json::Value::make_number(262144)}});
+}
+
 json::Value parse_conditioning_json(std::string_view text) {
     try {
         return json::parse(text);
@@ -106,8 +169,13 @@ Drama3Session::Drama3Session(runtime::TaskSpec task, const runtime::SessionOptio
     if (!assets_ || (task.task != runtime::VoiceTaskKind::Tts && task.task != runtime::VoiceTaskKind::VoiceCloning)) {
         throw std::runtime_error("Fish Drama 3 supports TTS and voice cloning");
     }
-    generator_ = std::make_unique<Drama3Generator>(assets_, execution_context(), options,
-        task_.mode == runtime::RunMode::Streaming);
+    const auto planning = runtime::find_option(options.options, {"fish_drama3.planning_only"});
+    if (planning && runtime::parse_bool_option(*planning, "fish_drama3.planning_only")) {
+        planning_tokenizer_ = std::make_unique<Drama3TextTokenizer>(assets_->resources);
+    } else {
+        generator_ = std::make_unique<Drama3Generator>(assets_, execution_context(), options,
+            task_.mode == runtime::RunMode::Streaming);
+    }
 }
 Drama3Session::~Drama3Session() = default;
 std::string Drama3Session::family() const { return "fish_drama3"; }
@@ -122,7 +190,7 @@ void Drama3Session::prepare(const runtime::SessionPreparationRequest & request) 
     mark_prepared();
 }
 
-Drama3Take Drama3Session::conditioning_take(const json::Value & value) {
+Drama3Take Drama3Session::conditioning_take(const json::Value & value, bool require_codes) {
     Drama3Take take;
     std::optional<std::string> audio_path;
     try {
@@ -138,7 +206,12 @@ Drama3Take Drama3Session::conditioning_take(const json::Value & value) {
     }
     // Only parsing above translates client errors. I/O and codec failures retain
     // their original classification.
-    if (audio_path) take.codes = generator_->encode_reference(read_reference(*audio_path));
+    if (audio_path) {
+        if (require_codes || !generator_) {
+            throw runtime::InvalidRequestError("Drama 3 prompt inspection requires pre-encoded vq_codes");
+        }
+        take.codes = generator_->encode_reference(read_reference(*audio_path));
+    }
     return take;
 }
 
@@ -153,6 +226,8 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
     for (const auto & option : request.options) effective.options[option.first] = option.second;
     effective.input_artifacts = request.input_artifacts;
     if (!effective.text_input) throw runtime::InvalidRequestError("Drama 3 requires input text");
+    const auto inspect = runtime::find_option(effective.options, {"inspect_prompt"});
+    const bool inspection = !generator_ || (inspect && runtime::parse_bool_option(*inspect, "inspect_prompt"));
     std::optional<std::vector<std::string>> explicit_segments;
     if (const auto segments = runtime::find_option(effective.options, {"text_segments"})) {
         explicit_segments = parse_drama3_text_segments(*segments);
@@ -180,6 +255,7 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
         throw runtime::InvalidRequestError("Drama 3 requires reference audio or a reference descriptor with VQ codes");
     }
     if (effective.voice && effective.voice->speaker && effective.voice->speaker->audio) {
+        if (inspection) throw runtime::InvalidRequestError("Drama 3 prompt inspection requires pre-encoded vq_codes");
         const auto transcript = runtime::find_option(effective.options, {"reference_text"});
         if (!transcript) throw runtime::InvalidRequestError("Drama 3 reference audio requires reference_text");
         references.push_back({*transcript, generator_->encode_reference(*effective.voice->speaker->audio)});
@@ -187,13 +263,13 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
     if (const auto ordered = runtime::find_option(effective.options, {"multi_reference_cond", "references"})) {
         const auto descriptors = parse_conditioning_json(*ordered);
         if (!descriptors.is_array()) throw runtime::InvalidRequestError("Drama 3 references must be a JSON array");
-        for (const auto & value : descriptors.as_array()) references.push_back(conditioning_take(value));
+        for (const auto & value : descriptors.as_array()) references.push_back(conditioning_take(value, inspection));
     }
     if (task_.task == runtime::VoiceTaskKind::VoiceCloning && references.empty()) {
         throw runtime::InvalidRequestError("Drama 3 cloning requires at least one reference");
     }
     if (const auto prepare = runtime::find_option(effective.options, {"encode_reference_only"});
-        prepare && runtime::parse_bool_option(*prepare, "encode_reference_only")) {
+        !inspection && prepare && runtime::parse_bool_option(*prepare, "encode_reference_only")) {
         if (references.empty()) throw runtime::InvalidRequestError("Reference preparation requires reference audio or codes");
         if (task_.mode == runtime::RunMode::Streaming) generator_->warm_streaming_codec(references.front().codes);
         runtime::TaskResult result;
@@ -212,7 +288,7 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
             throw runtime::InvalidRequestError("Drama 3 continuation cannot consume acoustic tokens from another model family");
         }
         const std::string payload(reinterpret_cast<const char *>(artifact.payload.data()), artifact.payload.size());
-        history.push_back(conditioning_take(parse_conditioning_json(payload)));
+        history.push_back(conditioning_take(parse_conditioning_json(payload), inspection));
     }
     const auto takes = runtime::find_option(effective.options, {"previous_takes"});
     const auto takes_file = runtime::find_option(effective.options, {"previous_takes_file"});
@@ -221,15 +297,40 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
         const auto descriptors = parse_conditioning_json(takes_file ? engine::io::read_text_file(*takes_file) : *takes);
         const auto append_take = [&](const json::Value & value) {
             if (value.is_string()) {
+                if (inspection) throw runtime::InvalidRequestError("Drama 3 prompt inspection requires pre-encoded history takes");
                 auto generated = generator_->generate(value.as_string(), references, history, sampling, false);
                 history.push_back({value.as_string(), std::move(generated.codes)});
-            } else history.push_back(conditioning_take(value));
+            } else history.push_back(conditioning_take(value, inspection));
         };
         if (descriptors.is_array()) {
             for (const auto & value : descriptors.as_array()) append_take(value);
         } else {
             append_take(descriptors);
         }
+    }
+    if (inspection) {
+        if (explicit_segments && (explicit_segments->size() != 1 ||
+            explicit_segments->front() != effective.text_input->text)) {
+            throw runtime::InvalidRequestError("Drama 3 prompt inspection requires one explicit input unit");
+        }
+        if (!planning_tokenizer_) planning_tokenizer_ = std::make_unique<Drama3TextTokenizer>(assets_->resources);
+        const auto counted = inspect_drama3_prompt(*assets_, *planning_tokenizer_,
+            effective.text_input->text, references, history);
+        runtime::TaskResult result;
+        result.output_artifacts.push_back(runtime::make_text_artifact(runtime::ArtifactKind::Custom,
+            "drama3_prompt", json::stringify(json::Value::make_object({
+                {"prompt_rows", json::Value::make_number(counted.prompt_rows)},
+                {"current_text_rows", json::Value::make_number(counted.current_text_rows)},
+                {"history_turn_rows", json::Value::make_number(counted.history_turn_rows)}})),
+            {{"family", "fish_drama3"}, {"schema", "drama3_prompt_v1"}}));
+        if (const auto device = runtime::parse_i64_option(effective.options, {"inspect_memory_device"})) {
+            if (*device < 0 || *device > std::numeric_limits<int>::max())
+                throw runtime::InvalidRequestError("CUDA memory device must be a nonnegative index");
+            result.output_artifacts.push_back(runtime::make_text_artifact(runtime::ArtifactKind::Custom,
+                "drama3_memory", json::stringify(memory_profile(*assets_, static_cast<int>(*device))),
+                {{"family", "fish_drama3"}, {"schema", "drama3_memory_v1"}}));
+        }
+        return result;
     }
     const auto skip_empty = runtime::find_option(effective.options, {"skip_empty_chunks"});
     const bool skip_empty_chunks = skip_empty && runtime::parse_bool_option(*skip_empty, "skip_empty_chunks");
