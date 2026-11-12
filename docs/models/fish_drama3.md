@@ -118,6 +118,9 @@ Counts are returned even when a candidate exceeds the configured generation cont
 
 The optional request option `inspect_memory_device=N` adds a `drama3_memory` artifact with the CUDA device's `total_bytes` and `free_bytes`, plus `weight_storage_bytes`, `fixed_state_bytes`, `cache_bytes_per_row` and `maximum_context_rows`. Querying device memory can initialize its CUDA context, but does not load inference weights. Storage/cache accounting assumes fully resident weights and the default F16 caches; it does not model overrides such as F32 caches. Codec packed/split views count once. Callers must separately reserve memory for graphs, codec workspace and allocator overhead. The free-memory snapshot does not reserve VRAM against other processes or guarantee an allocation will succeed.
 
+For the fully resident, default-F16 streaming path, set `inspect_workspace_context=C` and `inspect_workspace_prompt=P` on an inspection request to add a `drama3_workspace` JSON artifact. Require `0 < P < C <= 262144`; `P` must cover the largest planned prompt including generated history and enabled warmup. The artifact reports `context_rows`, `prompt_rows`, `backbone_prefill_bytes`, `tower_prefill_bytes`, `decode_bytes`, `codec_bytes`, `cached_graph_bytes` and `total_bytes`. It estimates a conservative model-dimension envelope for backbone masks and layer activations, 128-row tower prefill blocks, decode graphs, four-frame streaming codec batches, and the default 256 MiB prefill cache for each speech network. These resident envelopes are added, not multiplied by the number of sequential requests. Add this workspace to weights, recurrent state and context caches before admission; retain separate allocator/library overhead headroom. This is a shape-based estimate, not an exact backend allocation trace, and does not account for nondefault session options.
+
+
 ## Generate and stream
 
 Host sampling is used by default. Set

@@ -81,6 +81,55 @@ json::Value memory_profile(const Drama3Assets & assets, int device) {
         {"maximum_context_rows", json::Value::make_number(262144)}});
 }
 
+// Conservative live-tensor envelopes for the all-GPU, F16-cache streaming path.
+// The largest full-attention, linear-attention and MoE layer determines backbone
+// scratch; layer scratch is reused. Persistent masks/inputs, retained prefill
+// graphs and simultaneously resident backbone/tower/codec graphs are additional.
+// Backend allocator, kernel and library overhead remains the caller's reserve.
+json::Value workspace_profile(const Drama3Assets & assets, uint64_t context, uint64_t prompt) {
+    if (context < 2 || context > 262144 || prompt == 0 || prompt >= context)
+        throw runtime::InvalidRequestError("Drama 3 workspace requires 0 < prompt < context <= 262144");
+    const auto & b = assets.backbone;
+    const auto & t = assets.tower;
+    const uint64_t hidden = b.hidden_size;
+    const uint64_t query = b.heads * b.head_dim;
+    const uint64_t kv = b.kv_heads * b.head_dim;
+    const uint64_t value = b.linear_num_value_heads * b.linear_value_head_dim;
+    const uint64_t convolution = 2 * b.linear_num_key_heads * b.linear_key_head_dim + value;
+    // Include residual/norm/layout copies, projection/activation intermediates,
+    // routed expert inputs/outputs and recurrent output state in F32.
+    const uint64_t attention = 8 * hidden + 8 * query + 8 * kv;
+    const uint64_t linear = 8 * hidden + 8 * convolution + 8 * value + 16 * b.linear_num_value_heads;
+    const uint64_t moe = 8 * hidden + 6 * b.experts_per_token * b.intermediate_size +
+        2 * b.experts_per_token * hidden + 8 * b.experts + 4 * b.intermediate_size;
+    const uint64_t state = b.linear_value_head_dim * value;
+    const uint64_t backbone = 2 * prompt * prompt + 4 * prompt *
+        (std::max({attention, linear, moe}) + 2 * hidden + 1) + 8 * state;
+    const uint64_t tower_row = 8 * t.hidden_size + 8 * t.heads * t.head_dim +
+        8 * t.kv_heads * t.head_dim + 6 * t.intermediate_size;
+    const uint64_t block = std::min<uint64_t>(prompt, Drama3Tower::prefill_block_rows);
+    const uint64_t tower = 4 * block * tower_row + 2 * context * block;
+    const uint64_t decode = 4 * (std::max({attention, linear, moe}) + b.vocab_size +
+        (t.shared_layers + t.residual_layers + 1) * (tower_row + t.codebook_size)) +
+        2 * context * (t.shared_layers + t.residual_layers + 1) + 8 * state;
+    // Streaming decode uses fixed four-frame batches, independent of clip length.
+    // Bound eight simultaneous full-width upsampling/conv work buffers; narrower
+    // decoder stages fit this latent-width envelope.
+    const uint64_t codec = 4ull * assets.codec.frame_length * assets.codec.latent_dim * sizeof(float) * 8;
+    // Native defaults retain up to 256 MiB each of backbone and tower prefills.
+    // A newly allocated working graph may coexist with those older shapes.
+    const uint64_t cached = 512ull * 1024 * 1024;
+    return json::Value::make_object({
+        {"context_rows", json::Value::make_number(context)},
+        {"prompt_rows", json::Value::make_number(prompt)},
+        {"backbone_prefill_bytes", json::Value::make_number(backbone)},
+        {"tower_prefill_bytes", json::Value::make_number(tower)},
+        {"decode_bytes", json::Value::make_number(decode)},
+        {"codec_bytes", json::Value::make_number(codec)},
+        {"cached_graph_bytes", json::Value::make_number(cached)},
+        {"total_bytes", json::Value::make_number(backbone + tower + decode + codec + cached)}});
+}
+
 json::Value parse_conditioning_json(std::string_view text) {
     try {
         return json::parse(text);
@@ -329,6 +378,14 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
             result.output_artifacts.push_back(runtime::make_text_artifact(runtime::ArtifactKind::Custom,
                 "drama3_memory", json::stringify(memory_profile(*assets_, static_cast<int>(*device))),
                 {{"family", "fish_drama3"}, {"schema", "drama3_memory_v1"}}));
+        }
+        if (const auto context = runtime::parse_i64_option(effective.options, {"inspect_workspace_context"})) {
+            const auto prompt = runtime::parse_i64_option(effective.options, {"inspect_workspace_prompt"});
+            if (*context < 2 || !prompt || *prompt < 1)
+                throw runtime::InvalidRequestError("Drama 3 workspace inspection requires positive context and prompt rows");
+            result.output_artifacts.push_back(runtime::make_text_artifact(runtime::ArtifactKind::Custom,
+                "drama3_workspace", json::stringify(workspace_profile(*assets_, *context, *prompt)),
+                {{"family", "fish_drama3"}, {"schema", "drama3_workspace_v1"}}));
         }
         return result;
     }
