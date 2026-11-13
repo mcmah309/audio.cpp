@@ -73,10 +73,9 @@ public:
             throw runtime::InvalidRequestError("Alignment inspection requires text and language");
         const auto samples = runtime::parse_i64_option(request.options, {"inspect_audio_samples"}).value_or(0);
         const auto rate = runtime::parse_i64_option(request.options, {"inspect_sample_rate"}).value_or(0);
-        const auto device = runtime::parse_i64_option(request.options, {"inspect_memory_device"}).value_or(-1);
-        if (samples <= 0 || rate <= 0 || rate > std::numeric_limits<int>::max() || device < 0 ||
-            device > std::numeric_limits<int>::max() || static_cast<uint64_t>(samples) > multiply(rate, 300))
-            throw runtime::InvalidRequestError("Alignment inspection requires a device and audio bounds within five minutes");
+        if (samples <= 0 || rate <= 0 || rate > std::numeric_limits<int>::max() ||
+            static_cast<uint64_t>(samples) > multiply(rate, 300))
+            throw runtime::InvalidRequestError("Alignment inspection requires audio bounds within five minutes");
         const auto & config = assets_->config;
         const auto & encoder = config.audio_encoder;
         const auto & decoder = config.text_decoder;
@@ -114,7 +113,6 @@ public:
         const auto weights = weight_bytes(*assets_);
         const auto workspace = add(encoder_workspace, classification_workspace);
         const auto profile = json::Value::make_object({
-            {"device", json::Value::make_number(device)},
             {"maximum_audio_samples", json::Value::make_number(samples)},
             {"sample_rate", json::Value::make_number(rate)},
             {"prompt_rows", json::Value::make_number(rows)},

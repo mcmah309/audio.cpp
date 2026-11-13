@@ -69,7 +69,6 @@ public:
         inspection.cli.request_options = {
             {"inspect_audio_samples", "int", "Maximum input samples for CPU-only memory inspection.", false},
             {"inspect_sample_rate", "int", "Input sample rate for CPU-only memory inspection.", false},
-            {"inspect_memory_device", "int", "CUDA device budgeted by CPU-only memory inspection.", false},
             {"clamp_timestamps_to_audio", "bool", "Opt-in guard for word timestamp output: keep repaired word spans inside the local audio input. Defaults to false to preserve existing timestamp repair behavior.", false, "false"},
         };
         inspection.cli.session_options = {
