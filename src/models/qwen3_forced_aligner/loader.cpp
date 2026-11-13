@@ -3,6 +3,8 @@
 #include "engine/framework/model_spec/package.h"
 #include "engine/models/qwen3_asr/assets.h"
 #include "engine/models/qwen3_forced_aligner/session.h"
+#include "engine/models/qwen3_forced_aligner/planning.h"
+#include "engine/framework/runtime/options.h"
 
 #include <stdexcept>
 #include <utility>
@@ -65,9 +67,13 @@ public:
         const auto assets = load_qwen3_forced_aligner_assets(request.model_path);
         runtime::ModelInspection inspection;
         inspection.cli.request_options = {
+            {"inspect_audio_samples", "int", "Maximum input samples for CPU-only memory inspection.", false},
+            {"inspect_sample_rate", "int", "Input sample rate for CPU-only memory inspection.", false},
+            {"inspect_memory_device", "int", "CUDA device budgeted by CPU-only memory inspection.", false},
             {"clamp_timestamps_to_audio", "bool", "Opt-in guard for word timestamp output: keep repaired word spans inside the local audio input. Defaults to false to preserve existing timestamp repair behavior.", false, "false"},
         };
         inspection.cli.session_options = {
+            {"qwen3_forced_aligner.planning_only", "bool", "Inspect model storage and bounded workspace without loading inference weights; CPU only.", false, "false"},
             {"qwen3_forced_aligner.weight_type", "native|f32|f16|bf16|q8_0", "Shared thinker matmul storage; does not override audio encoder storage. Default: native.", false, "native"},
             {"qwen3_forced_aligner.audio_encoder_weight_type", "native|f32|f16", "Audio encoder matmul storage. Default: native.", false, "native"},
             {"qwen3_forced_aligner.thinker_weight_type", "native|f32|f16|bf16|q8_0", "Thinker matmul storage; inherits weight_type when omitted."},
@@ -123,6 +129,9 @@ std::unique_ptr<runtime::IVoiceTaskSession> Qwen3ForcedAlignerLoadedModel::creat
     if (task.mode != runtime::RunMode::Offline) {
         throw std::runtime_error("Qwen3 forced aligner currently supports offline sessions");
     }
+    if (const auto planning = runtime::find_option(options.options, {"qwen3_forced_aligner.planning_only"});
+        planning && runtime::parse_bool_option(*planning, "qwen3_forced_aligner.planning_only"))
+        return make_planning_session(options, assets_);
     return std::make_unique<Qwen3ForcedAlignerSession>(task, options, assets_);
 }
 

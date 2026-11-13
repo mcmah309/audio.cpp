@@ -36,6 +36,27 @@
         "description": "Opt-in guard for word timestamp output: keep repaired word spans inside the local audio input. Defaults to false to preserve existing timestamp repair behavior.",
         "required": false,
         "default": false
+      },
+      {
+        "name": "inspect_audio_samples",
+        "type": "int",
+        "description": "Maximum source audio samples for planning-only memory inspection.",
+        "required": false,
+        "min": 1
+      },
+      {
+        "name": "inspect_sample_rate",
+        "type": "int",
+        "description": "Source sample rate for planning-only memory inspection.",
+        "required": false,
+        "min": 1
+      },
+      {
+        "name": "inspect_memory_device",
+        "type": "int",
+        "description": "CUDA device to budget in planning-only memory inspection.",
+        "required": false,
+        "min": 0
       }
     ],
     "session": [
@@ -97,6 +118,13 @@
         "required": false,
         "min": 1,
         "default": 64
+      },
+      {
+        "name": "planning_only",
+        "type": "bool",
+        "description": "CPU-only storage and bounded graph workspace inspection without inference weights.",
+        "required": false,
+        "default": false
       }
     ],
     "load": []

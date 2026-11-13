@@ -2247,10 +2247,12 @@ audiocpp_add_model(confucius4_r2t2
 
 audiocpp_add_model(qwen3_forced_aligner
     SOURCES
+        src/models/qwen3_forced_aligner/planning.cpp
         src/models/qwen3_forced_aligner/processor.cpp
         src/models/qwen3_forced_aligner/session.cpp
         src/models/qwen3_forced_aligner/loader.cpp
     INCLUDES
+        engine/models/qwen3_forced_aligner/planning.h
         engine/models/qwen3_forced_aligner/loader.h
     LOADERS
         engine::models::qwen3_forced_aligner::make_qwen3_forced_aligner_loader

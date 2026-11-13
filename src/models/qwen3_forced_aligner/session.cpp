@@ -130,6 +130,7 @@ Qwen3ForcedAlignerSession::Qwen3ForcedAlignerSession(
     for (const auto & [key, value] : options.options) {
         (void) value;
         if (key.rfind("qwen3_forced_aligner.", 0) == 0 &&
+            key != "qwen3_forced_aligner.planning_only" &&
             key != "qwen3_forced_aligner.audio_encoder_graph_arena_mb" &&
             key != "qwen3_forced_aligner.thinker_prefill_graph_arena_mb" &&
             key != "qwen3_forced_aligner.thinker_decode_graph_arena_mb" &&
