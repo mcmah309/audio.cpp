@@ -2258,6 +2258,8 @@ audiocpp_add_model(qwen3_forced_aligner
         engine::models::qwen3_forced_aligner::make_qwen3_forced_aligner_loader
     DEPENDS
         qwen3_asr
+    OBJECT_LIBRARIES
+        utf8proc_vendor
 )
 
 audiocpp_add_model(mms_forced_aligner
@@ -5357,6 +5359,7 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
             src/models/qwen3_asr/tokenizer_text.cpp
             src/models/qwen3_forced_aligner/processor.cpp)
         target_include_directories(qwen3_forced_aligner_processor_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unittests)
+        target_link_libraries(qwen3_forced_aligner_processor_test PRIVATE utf8proc_vendor)
         add_test(
             NAME qwen3_forced_aligner_processor_test
             COMMAND qwen3_forced_aligner_processor_test

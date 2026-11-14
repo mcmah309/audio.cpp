@@ -66,7 +66,7 @@ void test_zero_length_span_repair_and_clamping_use_the_input_rate() {
 }
 
 void test_punctuation_only_text_has_no_alignable_words() {
-    for (const std::string text : {".", "...", "?", " "}) {
+    for (const std::string text : {".", "...", "?", " ", "***", "'", "\xCC\x81"}) {
         engine::test::require(
             !engine::models::qwen3_forced_aligner::has_alignable_words(text, "English"),
             "punctuation-only forced-aligner text should not be alignable");
@@ -80,6 +80,12 @@ void test_word_text_has_alignable_words() {
     engine::test::require(
         engine::models::qwen3_forced_aligner::has_alignable_words("你好。", "Chinese"),
         "Chinese words should be alignable");
+    for (const std::string text : {"人々", "за́мок", "STRAẞE"}) {
+        const auto words = engine::models::qwen3_forced_aligner::tokenize_alignable_words(text, "English");
+        std::string joined;
+        for (const auto & word : words) joined += word;
+        engine::test::require(joined == text, "Unicode letters and attached marks must remain in alignment text");
+    }
 }
 
 }  // namespace

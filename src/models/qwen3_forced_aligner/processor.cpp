@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <stdexcept>
 
+#include <utf8proc.h>
+
 namespace engine::models::qwen3_forced_aligner {
 namespace {
 
@@ -59,34 +61,42 @@ bool is_cjk(uint32_t codepoint) {
         (codepoint >= 0xF900 && codepoint <= 0xFAFF);
 }
 
-bool is_ascii_alnum(uint32_t codepoint) {
-    return (codepoint >= 'A' && codepoint <= 'Z') ||
-        (codepoint >= 'a' && codepoint <= 'z') ||
-        (codepoint >= '0' && codepoint <= '9');
+bool is_letter_or_number(uint32_t codepoint) {
+    const auto category = utf8proc_category(static_cast<utf8proc_int32_t>(codepoint));
+    return (category >= UTF8PROC_CATEGORY_LU && category <= UTF8PROC_CATEGORY_LO) ||
+        (category >= UTF8PROC_CATEGORY_ND && category <= UTF8PROC_CATEGORY_NO);
 }
 
-bool is_kept_non_ascii_letter_or_number(uint32_t codepoint) {
-    return (codepoint >= 0x00C0 && codepoint <= 0x02AF) ||
-        (codepoint >= 0x0370 && codepoint <= 0x03FF) ||
-        (codepoint >= 0x0400 && codepoint <= 0x052F) ||
-        (codepoint >= 0x0E00 && codepoint <= 0x0E7F) ||
-        (codepoint >= 0x3040 && codepoint <= 0x30FF) ||
-        (codepoint >= 0xAC00 && codepoint <= 0xD7AF);
+bool is_mark(uint32_t codepoint) {
+    const auto category = utf8proc_category(static_cast<utf8proc_int32_t>(codepoint));
+    return category >= UTF8PROC_CATEGORY_MN && category <= UTF8PROC_CATEGORY_ME;
 }
 
-bool is_kept_char(uint32_t codepoint) {
-    return codepoint == '\'' || is_ascii_alnum(codepoint) || is_cjk(codepoint) ||
-        is_kept_non_ascii_letter_or_number(codepoint);
+bool is_whitespace(uint32_t codepoint) {
+    const auto category = utf8proc_category(static_cast<utf8proc_int32_t>(codepoint));
+    return (codepoint >= '\t' && codepoint <= '\r') || codepoint == 0x85 ||
+        (category >= UTF8PROC_CATEGORY_ZS && category <= UTF8PROC_CATEGORY_ZP);
 }
 
 std::string clean_token(const std::string & token) {
     std::string out;
+    bool has_letter_or_number = false;
+    bool grapheme_has_letter_or_number = false;
+    utf8proc_int32_t previous = 0;
+    utf8proc_int32_t grapheme_state = 0;
     for (const auto & ch : utf8_chars(token)) {
-        if (is_kept_char(ch.codepoint)) {
+        if (utf8proc_grapheme_break_stateful(previous, ch.codepoint, &grapheme_state))
+            grapheme_has_letter_or_number = false;
+        const auto letter_or_number = is_letter_or_number(ch.codepoint);
+        grapheme_has_letter_or_number |= letter_or_number;
+        if (ch.codepoint == '\'' || letter_or_number ||
+            (is_mark(ch.codepoint) && grapheme_has_letter_or_number)) {
             out += ch.text;
+            has_letter_or_number |= letter_or_number;
         }
+        previous = ch.codepoint;
     }
-    return out;
+    return has_letter_or_number ? out : std::string{};
 }
 
 std::vector<std::string> split_segment_with_chinese(const std::string & segment) {
@@ -95,16 +105,20 @@ std::vector<std::string> split_segment_with_chinese(const std::string & segment)
     for (const auto & ch : utf8_chars(segment)) {
         if (is_cjk(ch.codepoint)) {
             if (!buffer.empty()) {
-                out.push_back(buffer);
+                const auto cleaned = clean_token(buffer);
+                if (!cleaned.empty()) out.push_back(cleaned);
                 buffer.clear();
             }
             out.push_back(ch.text);
+        } else if (is_mark(ch.codepoint) && buffer.empty() && !out.empty()) {
+            out.back() += ch.text;
         } else {
             buffer += ch.text;
         }
     }
     if (!buffer.empty()) {
-        out.push_back(buffer);
+        const auto cleaned = clean_token(buffer);
+        if (!cleaned.empty()) out.push_back(cleaned);
     }
     return out;
 }
@@ -124,7 +138,7 @@ std::vector<std::string> tokenize_space_language(const std::string & text) {
         segment.clear();
     };
     for (const auto & ch : utf8_chars(text)) {
-        if (ch.codepoint == ' ' || ch.codepoint == '\t' || ch.codepoint == '\n' || ch.codepoint == '\r') {
+        if (is_whitespace(ch.codepoint)) {
             flush();
         } else {
             segment += ch.text;
@@ -146,15 +160,25 @@ std::vector<std::string> tokenize_chinese_mixed(const std::string & text) {
             latin.clear();
         }
     };
+    bool grapheme_has_letter_or_number = false;
+    utf8proc_int32_t previous = 0;
+    utf8proc_int32_t grapheme_state = 0;
     for (const auto & ch : utf8_chars(text)) {
+        if (utf8proc_grapheme_break_stateful(previous, ch.codepoint, &grapheme_state))
+            grapheme_has_letter_or_number = false;
+        grapheme_has_letter_or_number |= is_letter_or_number(ch.codepoint);
         if (is_cjk(ch.codepoint)) {
             flush_latin();
             words.push_back(ch.text);
-        } else if (is_kept_char(ch.codepoint)) {
+        } else if (is_mark(ch.codepoint) && grapheme_has_letter_or_number && latin.empty() && !words.empty()) {
+            words.back() += ch.text;
+        } else if (ch.codepoint == '\'' || is_letter_or_number(ch.codepoint) ||
+            (is_mark(ch.codepoint) && grapheme_has_letter_or_number)) {
             latin += ch.text;
         } else {
             flush_latin();
         }
+        previous = ch.codepoint;
     }
     flush_latin();
     return words;

@@ -38,6 +38,13 @@
         "default": false
       },
       {
+        "name": "inspect_demand_only",
+        "type": "bool",
+        "description": "Return model limits and candidate encoder/prompt demand before detailed memory inspection.",
+        "required": false,
+        "default": false
+      },
+      {
         "name": "inspect_audio_samples",
         "type": "int",
         "description": "Maximum source audio samples for planning-only memory inspection.",

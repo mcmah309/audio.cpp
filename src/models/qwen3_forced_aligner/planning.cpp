@@ -73,43 +73,71 @@ public:
             throw runtime::InvalidRequestError("Alignment inspection requires text and language");
         const auto samples = runtime::parse_i64_option(request.options, {"inspect_audio_samples"}).value_or(0);
         const auto rate = runtime::parse_i64_option(request.options, {"inspect_sample_rate"}).value_or(0);
-        if (samples <= 0 || rate <= 0 || rate > std::numeric_limits<int>::max() ||
-            static_cast<uint64_t>(samples) > multiply(rate, 300))
-            throw runtime::InvalidRequestError("Alignment inspection requires audio bounds within five minutes");
+        if (samples <= 0 || rate <= 0 || rate > std::numeric_limits<int>::max())
+            throw runtime::InvalidRequestError("Alignment inspection requires positive audio bounds and sample rate");
         const auto & config = assets_->config;
         const auto & encoder = config.audio_encoder;
         const auto & decoder = config.text_decoder;
-        // Round resampling upward and retain two extra feature frames to cover
-        // frontend endpoint rounding. Minimum frontend input is half a second.
+        const auto maximum_samples = multiply(rate, 300);
+        const auto has_words = has_alignable_words(request.text_input->text, request.text_input->language);
+        // Count a candidate before constructing workspace bounds. One placeholder
+        // gives the text-only row count without expanding an oversized audio span.
         const auto resampled = std::max<uint64_t>(8000,
             add(multiply(samples, dimension(config.frontend.sample_rate)), rate - 1) / rate);
         const auto frames = add(resampled / dimension(config.frontend.hop_length), 2);
-        const auto chunk = multiply(2, dimension(encoder.n_window));
-        const auto padded = multiply(add(frames, chunk - 1) / chunk, chunk);
-        const auto tokens = modules::qwen3_audio_encoder_token_count(frames);
-        if (tokens > encoder.max_source_positions)
-            throw runtime::CapacityError("Alignment audio bound exceeds encoder positions");
-        const auto prompt = processor_.build_prompt(request.text_input->text, request.text_input->language, tokens);
-        const uint64_t rows = prompt.prompt.input_ids.size();
-        if (rows > dimension(decoder.max_position_embeddings))
-            throw runtime::CapacityError("Alignment prompt bound exceeds decoder positions");
-        // Live-tensor envelopes, not allocator traces: padded convolution and
-        // im2col/cast/activation buffers; transformer residual/QKV/MLP copies;
-        // F32 attention scores, softmax and masks; output projections/logits.
-        // Encoder and classification graphs remain resident together, but graph
-        // replacement releases the old graph before constructing its successor.
-        const auto conv = multiply(padded, add(multiply(8, multiply(dimension(encoder.num_mel_bins),
-            dimension(encoder.downsample_hidden_size))), multiply(8, dimension(encoder.num_mel_bins))));
-        const auto encoder_row = add(add(multiply(12, dimension(encoder.d_model)),
-            multiply(8, dimension(encoder.encoder_ffn_dim))), multiply(4, dimension(encoder.output_dim)));
-        const auto encoder_workspace = add(conv, add(multiply(4, multiply(tokens, encoder_row)),
-            multiply(8, multiply(multiply(tokens, tokens), add(dimension(encoder.encoder_attention_heads), 1)))));
-        const auto query = multiply(dimension(decoder.num_attention_heads), dimension(decoder.head_dim));
-        const auto kv = multiply(dimension(decoder.num_key_value_heads), dimension(decoder.head_dim));
-        const auto decoder_row = add(add(add(multiply(12, dimension(decoder.hidden_size)), multiply(8, query)),
-            add(multiply(8, kv), multiply(8, dimension(decoder.intermediate_size)))), dimension(decoder.output_size));
-        const auto classification_workspace = add(multiply(4, multiply(rows, decoder_row)),
-            multiply(8, multiply(multiply(rows, rows), add(dimension(decoder.num_attention_heads), 1))));
+        const auto tokens = has_words ? modules::qwen3_audio_encoder_token_count(frames) : 0;
+        const auto text_rows = has_words
+            ? processor_.build_prompt(request.text_input->text, request.text_input->language, 1).prompt.input_ids.size() - 1
+            : 0;
+        const auto required_rows = add(text_rows, tokens);
+        if (const auto option = runtime::find_option(request.options, {"inspect_demand_only"});
+            option && runtime::parse_bool_option(*option, "inspect_demand_only")) {
+            const auto demand = json::Value::make_object({
+                {"maximum_audio_samples", json::Value::make_number(maximum_samples)},
+                {"maximum_encoder_tokens", json::Value::make_number(dimension(encoder.max_source_positions))},
+                {"maximum_prompt_rows", json::Value::make_number(dimension(decoder.max_position_embeddings))},
+                {"audio_samples", json::Value::make_number(samples)},
+                {"encoder_tokens", json::Value::make_number(tokens)},
+                {"prompt_rows", json::Value::make_number(required_rows)},
+                {"has_words", json::Value::make_bool(has_words)}});
+            runtime::TaskResult result;
+            result.output_artifacts.push_back(runtime::make_text_artifact(runtime::ArtifactKind::Custom,
+                "qwen3_alignment_demand", json::stringify(demand), {{"family", family()}}));
+            return result;
+        }
+        if (static_cast<uint64_t>(samples) > maximum_samples)
+            throw runtime::CapacityError("Alignment audio bound exceeds five minutes");
+        // Execution returns no timestamps before constructing either graph for
+        // transcripts without alignable words. Only the model stays resident.
+        uint64_t rows = 0;
+        uint64_t encoder_workspace = 0;
+        uint64_t classification_workspace = 0;
+        if (has_words) {
+            const auto chunk = multiply(2, dimension(encoder.n_window));
+            const auto padded = multiply(add(frames, chunk - 1) / chunk, chunk);
+            if (tokens > encoder.max_source_positions)
+                throw runtime::CapacityError("Alignment audio bound exceeds encoder positions");
+            rows = required_rows;
+            if (rows > dimension(decoder.max_position_embeddings))
+                throw runtime::CapacityError("Alignment prompt bound exceeds decoder positions");
+            // Live-tensor envelopes, not allocator traces: padded convolution and
+            // im2col/cast/activation buffers; transformer residual/QKV/MLP copies;
+            // F32 attention scores, softmax and masks; output projections/logits.
+            // Encoder and classification graphs remain resident together, but graph
+            // replacement releases the old graph before constructing its successor.
+            const auto conv = multiply(padded, add(multiply(8, multiply(dimension(encoder.num_mel_bins),
+                dimension(encoder.downsample_hidden_size))), multiply(8, dimension(encoder.num_mel_bins))));
+            const auto encoder_row = add(add(multiply(12, dimension(encoder.d_model)),
+                multiply(8, dimension(encoder.encoder_ffn_dim))), multiply(4, dimension(encoder.output_dim)));
+            encoder_workspace = add(conv, add(multiply(4, multiply(tokens, encoder_row)),
+                multiply(8, multiply(multiply(tokens, tokens), add(dimension(encoder.encoder_attention_heads), 1)))));
+            const auto query = multiply(dimension(decoder.num_attention_heads), dimension(decoder.head_dim));
+            const auto kv = multiply(dimension(decoder.num_key_value_heads), dimension(decoder.head_dim));
+            const auto decoder_row = add(add(add(multiply(12, dimension(decoder.hidden_size)), multiply(8, query)),
+                add(multiply(8, kv), multiply(8, dimension(decoder.intermediate_size)))), dimension(decoder.output_size));
+            classification_workspace = add(multiply(4, multiply(rows, decoder_row)),
+                multiply(8, multiply(multiply(rows, rows), add(dimension(decoder.num_attention_heads), 1))));
+        }
         const auto weights = weight_bytes(*assets_);
         const auto workspace = add(encoder_workspace, classification_workspace);
         const auto profile = json::Value::make_object({

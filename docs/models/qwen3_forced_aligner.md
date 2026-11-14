@@ -43,6 +43,10 @@ audiocpp_cli --task align --family qwen3_forced_aligner --model models/Qwen3-For
 
 Create a CPU `align`/`offline` session with `qwen3_forced_aligner.planning_only=true`. Supply transcript text/language plus `inspect_audio_samples` and `inspect_sample_rate` request options. No waveform or inference weights are loaded. The `qwen3_alignment_memory` JSON artifact reports native weight storage, conservative encoder/classification workspace, total bytes and the inspected audio/prompt bounds. It describes one default-storage worker; add separate allocator/library headroom.
 
+Set `inspect_demand_only=true` first to obtain a `qwen3_alignment_demand` artifact with the model's audio, encoder-token and prompt-row limits and the candidate's corresponding demand. Oversized candidates return their demand normally, allowing callers to split text before detailed workspace inspection. Transcripts without letters or numbers have no alignable words and require no inference workspace; model weights remain resident.
+
+Token cleaning preserves Unicode letters, numbers and combining marks attached to them. Punctuation and standalone marks do not receive independent timings. Callers that need complete original-text coverage must retain source ranges for these unspoken characters as well.
+
 Inspect each matching text and maximum audio length before loading inference models. Encoder and classification graphs coexist, so workloads combine their individual maximum workspace costs. The estimate includes padded convolution and im2col/cast buffers, attention and MLP intermediates, positional tables and output logits. It is a model-shape envelope, not an exact allocation trace. Custom storage overrides require separate accounting. These inspection options apply only to the planning session.
 
 ## Session Options (use with `--session-option`)
